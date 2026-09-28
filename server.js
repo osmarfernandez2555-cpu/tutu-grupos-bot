@@ -261,7 +261,9 @@ function recibirMensaje(msg) {
   const key = msg && msg.key;
   if (!key || key.fromMe) return;
   const jid = key.remoteJid || '';
-  if (!jid.endsWith('@g.us')) return;               // solo grupos
+  const esGrupo = jid.endsWith('@g.us');
+  console.log('[WEBHOOK] Mensaje recibido de ' + jid + (esGrupo ? ' (grupo)' : ' (privado, se ignora)'));
+  if (!esGrupo) return;               // solo grupos
   if (key.id) { if (yaVisto('id:' + key.id)) return; marcarVisto('id:' + key.id); }
 
   const m = msg.message || {};
@@ -287,6 +289,7 @@ app.post('/webhook/evolution', (req, res) => {
   try {
     const body = req.body || {};
     const ev = String(body.event || '').toLowerCase().replace(/_/g, '.');
+    console.log('[WEBHOOK] Evento recibido: ' + (ev || '(sin nombre de evento)'));
     if (ev !== 'messages.upsert') return;
     const d = body.data;
     const items = Array.isArray(d) ? d : (d && Array.isArray(d.messages) ? d.messages : (d ? [d] : []));
