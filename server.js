@@ -74,7 +74,7 @@ function pareceAviso(t) {
   if (!t || t.length < 20 || t.length > 8000) return false;
   const anio   = /\b(19[789]\d|20[0-3]\d)\b/.test(t);
   const precio = /(\$|u\$s|us\$|usd|d[oó]lar|mill[oó]n|palos|\b\d{1,3}(\.\d{3}){1,2}\b|\b\d{5,9}\b)/i.test(t);
-  const km     = /\bkm\b|\bkms\b|kil[oó]metro/i.test(t);
+  const km     = /\d\s*kms?\b|kil[oó]metros?/i.test(t);
   return [anio, precio, km].filter(Boolean).length >= 2;
 }
 const normalizarTexto = t => String(t).toLowerCase().replace(/\s+/g, ' ').trim();
@@ -266,14 +266,25 @@ function recibirMensaje(msg) {
   if (!esGrupo) return;               // solo grupos
   if (key.id) { if (yaVisto('id:' + key.id)) return; marcarVisto('id:' + key.id); }
 
-  const m = msg.message || {};
+  // Algunos grupos tienen mensajes temporales/"ver una vez" activados: el contenido real
+  // viene anidado adentro de un wrapper y si no se desenvuelve, el bot no ve ningún texto.
+  let m = msg.message || {};
+  const wrappers = ['ephemeralMessage', 'viewOnceMessage', 'viewOnceMessageV2', 'viewOnceMessageV2Extension', 'documentWithCaptionMessage'];
+  for (let i = 0; i < 3; i++) { // por si vienen anidados varios wrappers seguidos
+    const w = wrappers.find(k => m[k] && m[k].message);
+    if (!w) break;
+    m = m[w].message;
+  }
+
   const texto = String(m.conversation || (m.extendedTextMessage && m.extendedTextMessage.text) ||
     (m.imageMessage && m.imageMessage.caption) || (m.videoMessage && m.videoMessage.caption) ||
     (m.documentMessage && m.documentMessage.caption) || '').trim();
 
   const grupo = registrarGrupo(jid);
   if (!grupo.activo) return;
-  if (!pareceAviso(texto)) return;
+  const pasaFiltro = pareceAviso(texto);
+  console.log('[FILTRO] ' + (pasaFiltro ? 'PASA' : 'descartado') + ' (' + texto.length + ' caract.): "' + texto.slice(0, 80).replace(/\n/g, ' ↵ ') + (texto.length > 80 ? '...' : '') + '"');
+  if (!pasaFiltro) return;
   if (pendientes >= MAX_COLA) { console.warn('[COLA] Llena (' + pendientes + '), se descarta un mensaje'); return; }
   const remitente = datosRemitente(msg);
   encolar(() => procesarAviso({ jid, texto, remitente }));
