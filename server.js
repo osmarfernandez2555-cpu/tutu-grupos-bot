@@ -24,6 +24,10 @@ const DB_PATH      = process.env.DB_PATH || path.join(__dirname, 'grupos.db');
 const ACTIVE_GROUPS = (process.env.ACTIVE_GROUPS || '').split(',').map(s => s.trim()).filter(Boolean);
 const TTL_MS       = 7 * 24 * 60 * 60 * 1000; // memoria de mensajes ya vistos
 const MAX_COLA     = 200;
+const REINTENTO_MS = 5 * 60 * 1000;            // cada cuánto reintenta los avisos que fallaron
+const PEND_MAX_MS  = 3 * 24 * 60 * 60 * 1000;  // los pendientes viejos (3 días) se descartan
+// La clave se limpia: un espacio, salto de línea o comillas pegadas en Railway dan "invalid x-api-key"
+const ANTHROPIC_KEY = String(process.env.ANTHROPIC_API_KEY || '').trim().replace(/^["']+|["']+$/g, '').trim();
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const sha1  = s => crypto.createHash('sha1').update(String(s)).digest('hex');
@@ -40,6 +44,10 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS log_autos (
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, grupo TEXT, vendedor TEXT, telefono TEXT,
     marca TEXT, modelo TEXT, anio TEXT, precio TEXT, accion TEXT, error TEXT
+  );
+  CREATE TABLE IF NOT EXISTS pendientes (
+    clave TEXT PRIMARY KEY, ts INTEGER, jid TEXT, texto TEXT, remitente TEXT,
+    intentos INTEGER DEFAULT 0, error TEXT DEFAULT ''
   );
 `);
 // Grupos que queden activos aunque la base se borre (por si no tenés Volume en Railway)
@@ -86,6 +94,7 @@ Devolvé SOLO un JSON array, sin texto adicional ni markdown. Cada elemento es u
 
 Reglas:
 - Si el mensaje NO ofrece vehículos en venta (charla, saludos, consultas, pedidos de compra como "busco", "necesito", "compro", "se busca", publicidad de servicios, repuestos, motos, camiones pesados) devolvé [].
+- Cuenta como EN VENTA aunque no diga "vendo": "ingresa", "va a ingresar", "ingresó", "entra en consignación", "recibimos", "disponible", "nuevo ingreso", "tomamos en parte de pago" o una ficha con marca/modelo/año/km. Solo "busco/compro/necesito" es pedido de compra.
 - Un mensaje puede traer varios autos: un elemento por cada uno.
 - marca: si no la dice pero es inequívoca por el modelo (Fiesta→Ford, Gol→Volkswagen, Corsa→Chevrolet, Cronos→Fiat, Hilux→Toyota), completala. Si no podés, "".
 - modelo: solo el modelo (ej "Gol Trend", "Hilux"). version: motor/equipamiento/trim (ej "1.6 SE Plus", "SRV 4x4 AT").
@@ -103,7 +112,7 @@ async function llamarClaude(texto) {
   for (let intento = 0; intento < 2; intento++) {
     const r = await fetch(ANTHROPIC_URL, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY || '', 'anthropic-version': '2023-06-01' },
+      headers: { 'content-type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(60000)
     });
@@ -158,7 +167,12 @@ function normalizarAuto(a) {
 
 async function extraerAutos(texto) {
   const raw = await llamarClaude(texto);
-  return parsearJsonArray(raw).map(normalizarAuto).filter(Boolean);
+  const crudos = parsearJsonArray(raw);
+  const autos = crudos.map(normalizarAuto).filter(Boolean);
+  if (!autos.length) {
+    console.log('[CLAUDE] 0 autos (' + crudos.length + ' sin datos suficientes). Respuesta: ' + String(raw).slice(0, 200).replace(/\n/g, ' '));
+  }
+  return autos;
 }
 
 // ── Ruthina ──────────────────────────────────────────────────────────────────
@@ -228,8 +242,13 @@ async function procesarAviso({ jid, texto, remitente }) {
 
   let autos;
   try { autos = await extraerAutos(texto); }
-  catch (e) { console.error('[CLAUDE] Error:', e.message); return; } // sin marcar como visto: si lo reenvían, reintenta
+  catch (e) {
+    console.error('[CLAUDE] Error:', e.message + ' → queda en pendientes, se reintenta solo');
+    guardarPendiente(claveTxt, { jid, texto, remitente }, e.message);
+    return;
+  }
   marcarVisto(claveTxt);
+  db.prepare('DELETE FROM pendientes WHERE clave = ?').run(claveTxt);
   if (!autos.length) return;
 
   console.log('[GRUPO] ' + grupoNombre + ' | ' + (remitente.nombre || 'sin nombre') + ' | ' + (remitente.telefono || 'sin-tel') + ' → ' + autos.length + ' auto(s)');
@@ -256,6 +275,26 @@ async function procesarAviso({ jid, texto, remitente }) {
     }
   }
 }
+
+// ── Pendientes: avisos que fallaron (clave inválida, Claude caído, etc.) ─────
+function guardarPendiente(clave, datos, error) {
+  db.prepare(`INSERT INTO pendientes (clave, ts, jid, texto, remitente, intentos, error) VALUES (?,?,?,?,?,1,?)
+              ON CONFLICT(clave) DO UPDATE SET intentos = intentos + 1, error = excluded.error`)
+    .run(clave, Date.now(), datos.jid, datos.texto, JSON.stringify(datos.remitente || {}), String(error || '').slice(0, 300));
+}
+function reintentarPendientes() {
+  db.prepare('DELETE FROM pendientes WHERE ts < ?').run(Date.now() - PEND_MAX_MS);
+  const filas = db.prepare('SELECT * FROM pendientes ORDER BY ts ASC LIMIT 50').all();
+  if (!filas.length) return 0;
+  console.log('[PENDIENTES] Reintentando ' + filas.length + ' aviso(s)');
+  for (const f of filas) {
+    let remitente = {};
+    try { remitente = JSON.parse(f.remitente || '{}'); } catch (e) {}
+    encolar(() => procesarAviso({ jid: f.jid, texto: f.texto, remitente }));
+  }
+  return filas.length;
+}
+setInterval(reintentarPendientes, REINTENTO_MS).unref();
 
 function recibirMensaje(msg) {
   const key = msg && msg.key;
@@ -334,6 +373,12 @@ app.post('/admin/api/grupos/toggle', auth, async (req, res) => {
 app.get('/admin/api/log', auth, (req, res) => {
   res.json(db.prepare('SELECT * FROM log_autos ORDER BY id DESC LIMIT 40').all());
 });
+app.get('/admin/api/pendientes', auth, (req, res) => {
+  res.json(db.prepare('SELECT clave, ts, jid, substr(texto,1,160) texto, intentos, error FROM pendientes ORDER BY ts DESC LIMIT 50').all());
+});
+app.post('/admin/api/pendientes/reintentar', auth, (req, res) => {
+  res.json({ ok: true, reintentando: reintentarPendientes() });
+});
 app.post('/admin/api/probar', auth, async (req, res) => {
   const texto = String((req.body || {}).texto || '');
   try {
@@ -360,6 +405,8 @@ pre{background:#0d1020;border-radius:8px;padding:10px;white-space:pre-wrap;font-
 <h2>Probar un aviso (no carga nada en Ruthina)</h2>
 <textarea id="t" rows="5" placeholder="Pegá acá el texto de un aviso de un grupo"></textarea>
 <p><button id="probar" class="on">Probar</button></p><pre id="out"></pre>
+<h2>Avisos pendientes (fallaron, se reintentan solos cada 5 min)</h2>
+<p><button id="reint" class="on">Reintentar ahora</button></p><div id="pend">Cargando…</div>
 <h2>Últimos autos procesados</h2><div id="log">Cargando…</div>
 <script>
 var KEY = new URLSearchParams(location.search).get('key') || '';
@@ -402,7 +449,26 @@ document.getElementById('probar').onclick = function(){
   api('/admin/api/probar', {method:'POST', body: JSON.stringify({texto: document.getElementById('t').value})})
     .then(function(d){ out.textContent = JSON.stringify(d, null, 2); });
 };
-cargarGrupos(); cargarLog(); setInterval(function(){ cargarGrupos(); cargarLog(); }, 15000);
+function cargarPend(){
+  api('/admin/api/pendientes').then(function(rows){
+    var c = document.getElementById('pend'); c.innerHTML = '';
+    if(!rows.length){ c.textContent = 'No hay pendientes 👍'; return; }
+    rows.forEach(function(r){
+      var d = el('div', null, 'card'), left = el('div');
+      left.appendChild(el('div', r.texto));
+      left.appendChild(el('div', fecha(r.ts) + ' · intentos: ' + r.intentos, 'sub'));
+      left.appendChild(el('div', r.error, 'sub err'));
+      d.appendChild(left); c.appendChild(d);
+    });
+  });
+}
+document.getElementById('reint').onclick = function(){
+  api('/admin/api/pendientes/reintentar', {method:'POST'}).then(function(d){
+    alert('Reintentando ' + d.reintentando + ' aviso(s). Revisá en unos segundos.');
+    setTimeout(function(){ cargarPend(); cargarLog(); }, 8000);
+  });
+};
+cargarGrupos(); cargarLog(); cargarPend(); setInterval(function(){ cargarGrupos(); cargarLog(); cargarPend(); }, 15000);
 </script></body></html>`;
 app.get('/admin', auth, (req, res) => res.type('html').send(ADMIN_HTML));
 
@@ -413,4 +479,17 @@ app.listen(PORT, () => {
     '| ADMIN_SECRET:', ADMIN_SECRET ? 'ok' : 'FALTA',
     '| Evolution (nombres de grupos):', (EVO_URL && EVO_APIKEY && EVO_INSTANCE) ? 'ok' : 'sin configurar',
     '| IMPORT_KEY:', IMPORT_KEY ? 'ok' : 'no usada');
+  verificarClave();
 });
+
+async function verificarClave() {
+  if (!ANTHROPIC_KEY) return console.error('[CLAUDE] FALTA ANTHROPIC_API_KEY en las variables de Railway');
+  if (!ANTHROPIC_KEY.startsWith('sk-ant-')) console.warn('[CLAUDE] La clave no empieza con "sk-ant-": revisá que esté bien copiada');
+  try {
+    const r = await fetch('https://api.anthropic.com/v1/models?limit=1', {
+      headers: { 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' }, signal: AbortSignal.timeout(15000)
+    });
+    if (r.ok) { console.log('[CLAUDE] Clave verificada OK (termina en ...' + ANTHROPIC_KEY.slice(-4) + ')'); reintentarPendientes(); }
+    else { const d = await r.json().catch(() => ({})); console.error('[CLAUDE] CLAVE INVÁLIDA (' + r.status + '): ' + ((d.error && d.error.message) || '') + ' — generá una nueva en console.anthropic.com'); }
+  } catch (e) { console.error('[CLAUDE] No pude verificar la clave:', e.message); }
+}
